@@ -19,3 +19,6 @@ vec-with-gaps = { path = "../vec-with-gaps/" }
 left-right = "0.11.4"
 itertools = "0.8.2"
 parking_lot = { version = "0.11.2", feature = ["nightly"] }
+
+[dev-dependencies]
+petgraph = "0.6.0"
