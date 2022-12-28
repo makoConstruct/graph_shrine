@@ -1,17 +1,19 @@
 #![allow(dead_code)]
 #![feature(test, allocator_api, generic_associated_types)]
 extern crate fastrand;
+extern crate itertools;
 extern crate petgraph;
 extern crate test;
-extern crate itertools;
-use itertools::{Itertools};
 use fastrand::Rng;
 use graph_shrine::{AdjacencyList, CSRPlusPlus, Graph};
+use itertools::Itertools;
+use petgraph::{
+    adj,
+    csr::Csr,
+    visit::{IntoNeighbors, NodeCount},
+};
+use std::{collections::HashMap, iter, slice};
 use test::Bencher;
-use petgraph::{adj, csr::Csr, visit::{IntoNeighbors, NodeCount}};
-use std::{slice, iter, collections::HashMap};
-
-
 
 // impl<G, K,V,E> Wander<K> for G where G:Graph<K,V,E, Index = K>, K:Clone {
 //     fn wander(from:K, r:&mut Rng)-> K {
@@ -28,13 +30,12 @@ use std::{slice, iter, collections::HashMap};
 //     }
 // }
 
-
-
-
-trait Works<K:Clone> {
-    type OutEdges<'a>: ExactSizeIterator<Item= K> where K: 'a;
-    fn edges<'a>(&'a self, from:K)-> Self::OutEdges<'a>;
-    fn random_vertex(&self, r:&mut Rng)-> K;
+trait Works<K: Clone> {
+    type OutEdges<'a>: ExactSizeIterator<Item = K>
+    where
+        K: 'a;
+    fn edges<'a>(&'a self, from: K) -> Self::OutEdges<'a>;
+    fn random_vertex(&self, r: &mut Rng) -> K;
     // fn set_edge(&mut self, from:K, to:K);
     // fn into_id(&self, v:usize)-> K;
     // fn from_edge_iter(
@@ -65,7 +66,6 @@ trait Works<K:Clone> {
     // }
 }
 
-
 // struct MapOutIter<I>(I);
 // impl<I, E, Index> Iterator for MapOutIter<I> where I:Iterator<Item=(Index, E)> {
 //     type Item = Index;
@@ -76,17 +76,21 @@ trait Works<K:Clone> {
 
 struct WorkGraph<G>(G);
 
-impl<K, G> Works<K> for WorkGraph<G> where G:Graph<usize,(),(), Index=K>, K: Clone + Eq {
+impl<K, G> Works<K> for WorkGraph<G>
+where
+    G: Graph<usize, (), (), Index = K>,
+    K: Clone + Eq,
+{
     // type OutEdges<'a> = MapOutIter<<Self as Graph<usize,(),()>>::OutIter<'a>>;
-    type OutEdges<'a> where K: 'a = iter::Map<
-        <G as Graph<usize,(),()>>::OutIter<'a>,
-        fn((K, &'a ()))-> K
-    >;
-    fn edges<'a>(&'a self, from:K)-> Self::OutEdges<'a> {
-        self.0.out_edges(from).unwrap().map(|(k,_)| k)
+    type OutEdges<'a>
+    where
+        K: 'a,
+    = iter::Map<<G as Graph<usize, (), ()>>::OutIter<'a>, fn((K, &'a ())) -> K>;
+    fn edges<'a>(&'a self, from: K) -> Self::OutEdges<'a> {
+        self.0.out_edges(from).unwrap().map(|(k, _)| k)
     }
     // fn into_id(&self, v:usize)-> K { Graph::<usize,(),()>::into_id(&self.0, v) }
-    fn random_vertex(&self, r:&mut Rng)-> K {
+    fn random_vertex(&self, r: &mut Rng) -> K {
         self.0.random_vertex(r)
     }
 }
@@ -100,39 +104,35 @@ impl Works<u32> for adj::List<()> {
     //     }
     //     r
     // }
-    fn edges<'a>(&'a self, from:u32)-> Self::OutEdges<'a> {
+    fn edges<'a>(&'a self, from: u32) -> Self::OutEdges<'a> {
         self.neighbors(from)
     }
-    fn random_vertex(&self, r:&mut Rng)-> u32 {
+    fn random_vertex(&self, r: &mut Rng) -> u32 {
         r.usize(0..self.node_count()) as u32
     }
 }
 
-
-
+//I shouldn't really use this for a real dataset.
 fn random_graph(
     r: &mut Rng,
     node_count: usize,
-    proportion_of_edges: f64,
+    number_of_edges_in_proportion_to_nodes: f64,
     additional_mandatory_edge_per_node: bool,
-) -> Vec<(usize, usize)>
-{
-    let edge_add_n = (node_count as f64 * proportion_of_edges) as usize;
-    let mut edges:Vec<(usize, usize)> = (0..edge_add_n).map(|_|{
+) -> Vec<(usize, usize)> {
+    let edge_add_n = (node_count as f64 * number_of_edges_in_proportion_to_nodes) as usize;
+    (0..edge_add_n).map(|_| {
         let firsti = r.usize(0..node_count);
-        (
-            firsti,
-            (firsti + r.usize(1..(node_count - 1))) % node_count
-        )
-    }).collect();
-    
-    if additional_mandatory_edge_per_node {
-        for i in 0..node_count {
-            let secondi = (i + r.usize(1..(node_count - 1))) % node_count;
-            edges.push((i, secondi));
+        (firsti, (firsti + r.usize(1..(node_count - 1))) % node_count)
+    })
+    .chain(
+        if additional_mandatory_edge_per_node {
+            (0..node_count).map(|i|{
+                (i, (i + r.usize(1..(node_count - 1))) % node_count)
+            })
+        }else{
+            [].iter()
         }
-    }
-    edges
+    ).collect()
 }
 
 fn wander<'a, G, K, V, E>(v: &'a G, r: &mut Rng, from: G::Index, hops: usize) -> G::Index
@@ -152,8 +152,7 @@ where
     cur
 }
 
-fn graph_prep(r: &mut Rng) -> Vec<(usize,usize)>
-{
+fn graph_prep(r: &mut Rng) -> Vec<(usize, usize)> {
     random_graph(r, 70000, 12.0, true)
 }
 fn bench_graph_wander<G>(b: &mut Bencher, g: &G, r: &mut Rng)
@@ -173,7 +172,7 @@ fn wander_adjacency_list(b: &mut Bencher) {
     let mut r = Rng::with_seed(40);
     let edges = graph_prep(&mut r);
     let nv = (0..edges.len()).map(|i| (i, ()));
-    let g = AdjacencyList::from_edges(nv, edges.iter().map(|&(a,b)| (a, b, ())));
+    let g = AdjacencyList::from_edges(nv, edges.iter().map(|&(a, b)| (a, b, ())));
     bench_graph_wander(b, &g, &mut r);
 }
 
@@ -206,7 +205,8 @@ fn wander_patterned_csrpp(b: &mut Bencher) {
     let mut r = Rng::with_seed(40);
     let edges = graph_prep(&mut r);
     let nv = (0..edges.len()).map(|i| (i, ()));
-    let ug: CSRPlusPlus<usize, (), ()> = CSRPlusPlus::from_edges(nv, edges.iter().map(|&(a,b)| (a,b,())));
+    let ug: CSRPlusPlus<usize, (), ()> =
+        CSRPlusPlus::from_edges(nv, edges.iter().map(|&(a, b)| (a, b, ())));
     let g = CSRPlusPlus::from_graph_with_radial_patterning(&ug, (), std::alloc::Global::default());
     bench_graph_wander(b, &g, &mut r);
 }

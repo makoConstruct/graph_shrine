@@ -8,21 +8,24 @@
     generic_associated_types,
     allocator_api
 )]
-#![allow(dead_code, unused_imports)]
+
+mod wotdb;
+pub use wotdb::*;
+
 extern crate bitvec;
 // extern crate itertools;
 extern crate fastrand; //required for radial patterning
 extern crate left_right;
 extern crate vec_with_gaps;
 
-use bitvec::vec::BitVec;
+// use bitvec::vec::BitVec;
 use fastrand::Rng;
 use itertools::Itertools;
 use std::{
     alloc,
     alloc::Allocator,
     cmp::{Ordering, Ordering::*},
-    collections::{hash_map::Entry::*, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry::*, HashMap, HashSet, VecDeque},
     default::{default, Default},
     error::Error,
     fmt,
@@ -30,11 +33,10 @@ use std::{
     hash::Hash,
     iter,
     iter::{ExactSizeIterator, Iterator, Peekable},
-    mem::{drop, replace, size_of},
-    ptr, slice,
+    mem::{drop, replace, size_of}, slice,
     vec::Vec,
 };
-use vec_with_gaps::{VecWithGaps, VecWithGapsConfig};
+use vec_with_gaps::{VecWithGaps};
 
 #[derive(Clone)]
 pub struct AdjacencyList<K, V, E> {
@@ -126,8 +128,10 @@ impl<K, V, E> Default for AdjacencyList<K, V, E> {
 
 impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
     /// by the way, nodes don't have to be specified if they're present in an edge
-    pub fn from_edges<'a>(nodes: impl Iterator<Item = (K, V)>, edges: impl Iterator<Item = (K, K, E)>) -> Self
-    {
+    pub fn from_edges<'a>(
+        nodes: impl Iterator<Item = (K, V)>,
+        edges: impl Iterator<Item = (K, K, E)>,
+    ) -> Self {
         let mut vertex_mapping = HashMap::<K, usize>::new();
         let mut vertexes: Vec<ALVert<_, _, _>> = Vec::new();
         let vmm = &mut vertex_mapping;
@@ -228,7 +232,7 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
     }
 }
 impl<K> AdjacencyList<K, f64, f64> {
-    fn add_weight_accumulating_sorted_biedge(&mut self, a: usize, b: usize, weight: f64) {
+    pub fn add_weight_accumulating_sorted_biedge(&mut self, a: usize, b: usize, weight: f64) {
         let mut over = |from: usize, to: usize| {
             let an = &mut self.vertexes[from];
             let dif = match an.out_edges.binary_search_by(|&(o, _)| o.cmp(&from)) {
@@ -252,7 +256,6 @@ impl<K> AdjacencyList<K, f64, f64> {
     }
 }
 
-//TODO: try HeaderVecing everything
 pub enum Edit<K, V, E> {
     NewVertex(K, V),
     NewEdge(EdgeAdd<E>),
@@ -267,52 +270,11 @@ pub struct EdgeAdd<E> {
     pub weight: E,
 }
 
-//TODO: try HeaderVecing everything
-
-//leftover from when I was going to replicate the functionality of left-right myself
-// struct CSRPlusPlus<'a, V, E, Conf> {
-//   a: RwLock<CSRPlusPlusWrite<V, E, Conf>>,
-//   b: RwLock<CSRPlusPlusWrite<V, E, Conf>>,
-//   which: AtomicBool, //b is the write iff true
-// }
-
-// fn start_switching(&mut self){
-//   let _ = self.switch_mutex.lock(); //just to make sure two switches can't happen at the same time x]
-//   let (was_read, was_write) = if which.read() {
-//     (&self.a, &self.b)
-//   }else{
-//     (&self.b, &self.a)
-//   };
-//   //evict lingering readers and prepare for writing
-//   unsafe{ forget(was_read.superlock.acquire_write()) }
-//   for s in was_read.segments.iter() {
-//     unsafe{ s.read_unlock() }
-//   }
-
-//   //evict lingering writers and prepare for reading
-//   for s in was_write.segments.iter() {
-//     unsafe{ forget(s.read_acquire()) }
-//   }
-//   {
-//     //replicate changes
-//     let bwl = was_write.buffered_writes.lock()
-//     was_read.apply(was_write.compiled_committed_writes)
-//     was_read.buffered_writes.replicate(bwl)
-//   }
-//   unsafe{ was_write.superlock.release_write() }
 
 //   //TODO: Replicate changes to the mapping hashmap with a simple copy iff it expanded since the last sync, otherwise repeat the insertions
 
-//   self.which.fetch_xor(true);
-// }
-
-// fn read_segment<'a>(&'a self)-> RwLockReadGuard<'a, Segment<V,E>> {
-//   if which {
-//     a
-//   }
-// }
-
 /// note, each segment was supposed to have a lock on it for parallel editing. I haven't put the locks in yet, because my use case is extremely read-heavy, wants to be lock-free most of the time
+/// Once that is needed, it should be possible to make reads lock-free while making writes parallel with segment locks
 /// K: keys, unique IDs the nodes are known by outside of the db
 /// V: values stored at each node
 /// E: weights stored on each of the edges,
@@ -401,6 +363,12 @@ pub struct Segment<K, V, E, A: Allocator> {
     pub out_edges: VecWithGaps<Edge<E>, VWGC, A>,
     pub in_edges: VecWithGaps<VAddr, VWGC, A>,
 }
+impl<K,V,E,A> Segment<K,V,E,A> {
+    fn get_weight(&self, at:VAddr)-> Res<&V> {
+        self.vertex_weights.get(at.index as usize).ok_or_else(|| NoVertex(at))
+    }
+}
+
 impl<K, V, E, A> PartialEq for Segment<K, V, E, A>
 where
     K: PartialEq,
@@ -468,8 +436,13 @@ impl<V> PartialOrd for Edge<V> {
 //   fn deleted(&self)-> bool { self.out_edges_length == -1 }
 // }
 
-impl<'a, K, V, E> From<&'a AdjacencyList<K,V,E>> for AdjacencyList<K,V,E> where K:Clone, V:Clone, E:Clone {
-    fn from(other:&'a AdjacencyList<K,V,E>)-> Self {
+impl<'a, K, V, E> From<&'a AdjacencyList<K, V, E>> for AdjacencyList<K, V, E>
+where
+    K: Clone,
+    V: Clone,
+    E: Clone,
+{
+    fn from(other: &'a AdjacencyList<K, V, E>) -> Self {
         other.clone()
     }
 }
@@ -527,11 +500,11 @@ where
         slice::Iter<'a, (Self::Index, E)>,
         fn(&'a (Self::Index, E)) -> (Self::Index, &'a E),
     >;
-    fn from_id(&self, v: Self::Index) -> usize {
+    fn from_id(&self, v: Self::Index) -> Self::Index {
         v
     }
     fn into_id(&self, v: usize) -> Self::Index {
-        v
+        v as Self::Index
     }
     fn mapping(&self) -> &HashMap<K, Self::Index> {
         &self.mapping
@@ -832,11 +805,11 @@ where
     pub fn new() -> Self {
         default()
     }
-    
+
     pub fn from_edges(
         nodes: impl Iterator<Item = (K, V)>,
         edges: impl Iterator<Item = (K, K, E)>,
-    )-> Self {
+    ) -> Self {
         Self::from_edges_detailed(nodes, edges, (), default())
     }
 }
@@ -847,7 +820,6 @@ fn csrpp_offset_to_id(segment_size: usize, v: usize) -> VAddr {
         index: (v % segment_size) as u32,
     }
 }
-
 
 impl<K, V, E, Conf, Alloc> CSRPlusPlus<K, V, E, Conf, Alloc>
 where
@@ -962,13 +934,25 @@ where
         V: 'a + Eq,
         E: 'a,
     {
-        Self::from_adjacency_list_detailed(&AdjacencyList::from_edges(nodes, edges), config, allocator)
+        Self::from_adjacency_list_detailed(
+            &AdjacencyList::from_edges(nodes, edges),
+            config,
+            allocator,
+        )
     }
-    
-    fn from_adjacency_list_detailed(al:&AdjacencyList<K,V,E>, config:Conf, allocator:Alloc)-> Self {
+
+    fn from_adjacency_list_detailed(
+        al: &AdjacencyList<K, V, E>,
+        config: Conf,
+        allocator: Alloc,
+    ) -> Self {
         Self::from_graph_with_radial_patterning(al, config, allocator)
     }
 
+    fn get_segment(&self, at: VAddr)-> Res<&Segment<K,V,E,Alloc>> {
+        self.segments.get(at.segment as usize).ok_or_else(|| NoSegment(at.segment))
+    }
+    
     fn remove_vertex_innard(&mut self, at: VAddr, handle_mapping: bool) -> bool {
         let se = if let Some(se) = self.segments.get_mut(at.segment as usize) {
             se

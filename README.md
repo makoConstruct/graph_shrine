@@ -14,9 +14,9 @@ Incomplete, roadmap:
 - [x] test performance against `AdjacencyList`
 	- that was disastrous. It's slower than an adjacencylist for graphs with a high branching factor and barely quicker (15%) for graphs with a low branching factor. This makes total sense, in retrospect, there will be very little memory adjacency benefits for highly random branching. However, random graphs are fairly unrealistic. It might perform better in the following task
 	- [ ] test performance with the tasteweb user model data
+		- [ ] can't model structures of tasteweb users without already having a bootstrap implementation of tasteweb datastructures. Implement one with an AdjacencyList.
 - [ ] test performance against `petgraph::csr::Csr`
-- [ ] make a HeaderVecWithGaps to eliminate one step of indirection
-- [ ] finish integrating left-right and test parallel performance against other graph databases
+- [ ] finish integrating left-right and test parallel performance against other graph databases (while noting respectfully that we have made great sacrifices to outrun them)
 - [ ] transition to a Capnp format for mem-mapping persistence
 
 Will be the fastest known graph database with these properties:

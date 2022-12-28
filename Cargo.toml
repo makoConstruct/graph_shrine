@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "the fastest known mutable graph"
 license = "MIT"
 authors = ["mako <marcus.yass@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -19,6 +19,7 @@ vec-with-gaps = { path = "../vec-with-gaps/" }
 left-right = "0.11.4"
 itertools = "0.8.2"
 parking_lot = { version = "0.11.2", feature = ["nightly"] }
+noisy_float = "0.2"
 
 [dev-dependencies]
 petgraph = "0.6.0"
