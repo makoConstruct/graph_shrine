@@ -1,5 +1,4 @@
 // implementation of CSR++: DOI:10.4230/LIPIcs.OPODIS.2020.17
-
 #![feature(
     result_into_ok_or_err,
     associated_type_defaults,
@@ -11,6 +10,8 @@
 
 mod wotdb;
 pub use wotdb::*;
+
+mod util;
 
 extern crate bitvec;
 // extern crate itertools;
@@ -192,7 +193,15 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
         }
         false
     }
-
+    pub fn v_mut(&mut self, at: Self::Index) -> Res<&mut V> {
+        self.vertexes
+            .get_mut(at)
+            .ok_or_else(|| NoAdjacencyIndex(at))
+            .map(|a| &mut a.v)
+    }
+    pub fn e(&self, a:usize, b:usize)-> Res<&E> {
+        self.out_edges(a).binary_search_by(|&(o, _)| o.cmp(b)).map_err(|_| CSRPPError::NoConnetion(a, b))
+    }
     pub fn from_sized_iters(
         i: impl ExactSizeIterator<Item = (K, V, impl ExactSizeIterator<Item = (K, E)>)> + Clone,
     ) -> Self {
@@ -447,13 +456,13 @@ where
     }
 }
 
-pub type Res<V> = Result<V, CSRPPError>;
 pub trait Graph<K, V, E> {
     type InIter<'a>: ExactSizeIterator<Item = Self::Index> + Clone + 'a;
     type OutIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a E)> + Clone + 'a
     where
         E: 'a;
     type Index: Debug = usize;
+    type Res<T> = Result<V, CSRPPError<Self::Index>>;
     fn next_id(&self) -> Self::Index; //needed for radial patterning. Must be greater than any vertex ID, and (for memory efficiency) should not be too much greater than the number of vertices in the structure, if it is, maybe regenerate your IDs.
     fn vertexes(&self) -> Vec<Self::Index>;
     fn vertex_count(&self) -> usize;
@@ -467,7 +476,7 @@ pub trait Graph<K, V, E> {
     fn remove_vertex(&mut self, v: Self::Index) -> bool;
     fn remove_vertex_called(&mut self, v: &K) -> bool;
     /// `overwrite` is about whether to overwrite the e of any existing edge between these two, if one exists
-    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> bool;
+    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> Res<E>;
     fn set_edge(&mut self, a: Self::Index, b: Self::Index, e: E, overwrite: bool) -> Res<bool>;
     fn set_biedge(&mut self, a: Self::Index, b: Self::Index, w: E, overwrite: bool) -> Res<()>
     where
@@ -500,6 +509,7 @@ where
         slice::Iter<'a, (Self::Index, E)>,
         fn(&'a (Self::Index, E)) -> (Self::Index, &'a E),
     >;
+    type Index = usize;
     fn from_id(&self, v: Self::Index) -> Self::Index {
         v
     }
@@ -606,15 +616,11 @@ where
         };
         (r, is_new)
     }
-    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> bool {
-        if let Some(fv) = self.vertexes.get_mut(from) {
-            if binary_remove_if_present_by(&mut fv.out_edges, |b| from.cmp(&b.0)).is_some() {
-                let tv = &mut self.vertexes[to];
-                binary_remove(&mut tv.in_edges, &to);
-                return true;
-            }
-        }
-        false
+    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> Res<E> {
+        let fv = self.vertexes.get_mut(from).ok_or_else(|| NoVertex(from))?;
+        let (_, ret) = binary_remove_if_present_by(&mut fv.out_edges, |b| to.cmp(&b.0)).ok_or_else(|| NoConnection(a, b))?;
+        binary_remove(&mut self.vertexes[to].in_edges, &from);
+        Ok(ret)
     }
     fn k_and_v(&self, at: Self::Index) -> Res<(&K, &V)> {
         let ve = self.vertexes.get(at).ok_or_else(|| NoAdjacencyIndex(at))?;
@@ -742,9 +748,11 @@ where
 // }
 
 #[derive(Debug, Clone)]
-pub enum CSRPPError {
+pub enum CSRPPError<VA> {
     NoSegment(u32),
-    NoVertex(VAddr),
+    NoVertex(VA),
+    NotLandmark(VA),
+    NoConnetion(VA, VA),
     NoAdjacencyIndex(usize),
     VecWithGapsIssue(String),
     Misc(String),
@@ -758,21 +766,23 @@ impl Display for CSRPPError {
         match *self {
             NoSegment(segment) => write!(
                 f,
-                "CSRPlusPlus getting segment {} failed, out of bounds",
+                "Graph error: getting segment {} failed, out of bounds",
                 segment
             ),
             NoVertex(index) => write!(
                 f,
-                "CSRPlusPlus getting vertex at index {:?} failed, vertex index {} does not exist",
+                "Graph error: getting vertex at index {:?} failed, vertex index {} does not exist",
                 index, index.index
             ),
+            NoConnetion(a, b)=> write!(f, "Graph error: the nodes {} and {} weren't conneted", a, b),
+            NotLandmark(a)=> write!(f, "Graph error: {} is not a landmark", a)
             NoAdjacencyIndex(index) => {
-                write!(f, "AdjacencyList getting vertex at index {} failed", index)
+                write!(f, "Graph error: AdjacencyList getting vertex at index {} failed", index)
             }
             VecWithGapsIssue(ref message) => {
                 write!(
                     f,
-                    "CSRPlusPlus had a problem with one of its vec-with-gaps: {}",
+                    "Graph error: CSRPlusPlus had a problem with one of its vec-with-gaps: {}",
                     message
                 )
             }
