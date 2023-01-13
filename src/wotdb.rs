@@ -389,7 +389,6 @@ impl<K, Conf> LarkWeb<K, Conf = ()> where K:Hash + Eq + Copy, Conf: LarkWebConfi
 	fn remove_edge(&mut self, a:Ni, b:Ni, distance:N64)-> Res<()> {
 		let atb:N64 = self.core.e(a, b)?;
 		self.core.remove_edge(a, b); //controversial, doing this so early (should it roll back in case of error? But there shouldn't be any errors! x])
-		//Consider: This (the branch over landmarks) is easily parallelizable. The distancing process for each landmark doesn't interact with the others. You can replace N64s with https://crates.io/crates/atomic_float
 		
 		//forward, updating the in_landmarks (that which flows in with the edges)
 		//so, abstract this and call this twice in both directions
@@ -399,9 +398,11 @@ impl<K, Conf> LarkWeb<K, Conf = ()> where K:Hash + Eq + Copy, Conf: LarkWebConfi
 		// out_landmarks:FnMut(&LarkNode)-> impl Iterator<Item=(N64, Ni)>,
 		// out_landmarks:FnMut(&LarkNode, l:Ni)-> N64,
 		
-		// Basically, for each landmark accessible via a
+		// Basically, for each landmark accessible via a:
 		// figures out what's inside the wound by dijstraing forward until it has covered everything that is shortest reachable from a
-		// then reevaluates their shortest paths to l, from shortest to longest
+		// then reevaluates their shortest paths to l, going from shortest to longest
+		
+		//Consider: This (the branch over landmarks) is easily parallelizable. The distancing process for each landmark doesn't interact with the others. You can replace N64s with https://crates.io/crates/atomic_float
 		
 		#[derive(Ord)]
 		struct InsidenessSearchEntry {
