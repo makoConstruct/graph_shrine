@@ -11,6 +11,8 @@
 mod wotdb;
 pub use wotdb::*;
 
+mod genesign_test;
+
 mod util;
 
 extern crate bitvec;
@@ -239,6 +241,9 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
             total_live_vertices: 0,
         }
     }
+    fn invalid_vi()-> Self::Index {
+        u64::max_value()
+    }
 }
 impl<K> AdjacencyList<K, f64, f64> {
     pub fn add_weight_accumulating_sorted_biedge(&mut self, a: usize, b: usize, weight: f64) {
@@ -461,10 +466,12 @@ pub trait Graph<K, V, E> {
     type OutIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a E)> + Clone + 'a
     where
         E: 'a;
+    type VIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a K, &'a V)> + Clone + 'a;
     type Index: Debug = usize;
     type Res<T> = Result<V, CSRPPError<Self::Index>>;
     fn next_id(&self) -> Self::Index; //needed for radial patterning. Must be greater than any vertex ID, and (for memory efficiency) should not be too much greater than the number of vertices in the structure, if it is, maybe regenerate your IDs.
     fn vertexes(&self) -> Vec<Self::Index>;
+    fn vertex_iter(&'a self)-> VIter<'a>;
     fn vertex_count(&self) -> usize;
     /// converts a n:usize into the id that would be nth if the graph were fully packed
     fn into_id(&self, v: usize) -> Self::Index;
@@ -488,6 +495,9 @@ pub trait Graph<K, V, E> {
         Ok(())
     }
     fn out_edges<'a>(&'a self, v: Self::Index) -> Res<Self::OutIter<'a>>;
+    fn out_neighbors<'a>(&'a self, v: Self::Index)-> Res<Map<Self::OutIter<'a>, fn((Self::Index, &'a E))-> (Self::Index, &'a V)>> {
+        self.out_edges(v).map(|o| o.map(|(i, _)| self.v(i).unwrap()))
+    }
     fn in_edges<'a>(&'a self, v: Self::Index) -> Res<Self::InIter<'a>>;
     /// (must point to a live vertex (is that obvious?))
     fn random_vertex(&self, r: &mut Rng) -> Self::Index;
@@ -509,6 +519,7 @@ where
         slice::Iter<'a, (Self::Index, E)>,
         fn(&'a (Self::Index, E)) -> (Self::Index, &'a E),
     >;
+    type VIter<'a> = Map<Enumerate<Iter<ALVert<K, V, E>>>, fn((Self::Index, &'a ALVert<K,V,E>)) -> (Self::Index, &'a K, &'a V)>;
     type Index = usize;
     fn from_id(&self, v: Self::Index) -> Self::Index {
         v
@@ -589,6 +600,9 @@ where
         (0..self.vertexes.len())
             .filter(|i| !self.vertexes[*i].deleted)
             .collect()
+    }
+    fn vertex_iter(&'a self)-> VIter<'a> {
+        self.vertexes.iter().enumerate().map(|i, alv| (i, &alv.k, &alv.v))
     }
     fn random_vertex(&self, r: &mut Rng) -> Self::Index {
         r.usize(0..self.vertexes.len())
@@ -1232,307 +1246,6 @@ where
     }
 }
 
-impl<K, V, E, Conf, Alloc> Graph<K, V, E> for CSRPlusPlus<K, V, E, Conf, Alloc>
-where
-    Alloc: Clone + Allocator,
-    Conf: Clone + CSRPPTuning,
-    K: Debug + Clone + Hash + Eq,
-    V: Clone,
-    E: Clone,
-{
-    type InIter<'a> = iter::Cloned<slice::Iter<'a, Self::Index>>;
-    type OutIter<'a>
-    where
-        E: 'a,
-    = iter::Map<slice::Iter<'a, Edge<E>>, fn(&'a Edge<E>) -> (Self::Index, &'a E)>;
-    type Index = VAddr;
-    fn next_id(&self) -> Self::Index {
-        if let Some(ls) = self.segments.last() {
-            if ls.vertex_weights.len() < self.config.segment_size() {
-                let vsn = ls.vertex_weights.len();
-                VAddr {
-                    segment: (self.segments.len() - 1) as u32,
-                    index: vsn as u32,
-                }
-            } else {
-                VAddr {
-                    segment: self.segments.len() as u32,
-                    index: 0,
-                }
-            }
-        } else {
-            VAddr {
-                segment: 0,
-                index: 0,
-            }
-        }
-    }
-    fn mapping(&self) -> &HashMap<K, Self::Index> {
-        &self.mapping
-    }
-    fn from_id(&self, v: Self::Index) -> usize {
-        v.segment as usize * self.config.segment_size() + v.index as usize
-    }
-    fn into_id(&self, v: usize) -> Self::Index {
-        csrpp_offset_to_id(self.config.segment_size(), v)
-    }
-    fn vertex_count(&self) -> usize {
-        self.total_live_vertices
-    }
-
-    fn set_vertex(&mut self, k: K, v: V) -> (Self::Index, bool) {
-        let nid = self.next_id();
-        self.mapping.insert(k.clone(), nid);
-        let sf = self.segments.get_mut(nid.segment as usize);
-        let is_new = !sf.is_some();
-        if let Some(se) = sf {
-            se.external_vertex_ids.push(k);
-            se.vertex_weights.push(v);
-            se.live_count += 1;
-        } else {
-            //then nid is in the next segment to be, create it
-            let mut vertex_weights = Vec::with_capacity(self.config.segment_size());
-            vertex_weights.push(v);
-            let mut external_vertex_ids = Vec::with_capacity(self.config.segment_size());
-            external_vertex_ids.push(k);
-            self.segments.push(Segment {
-                live_count: 1,
-                external_vertex_ids,
-                vertex_weights,
-                out_edges: VecWithGaps::many_with_capacity_detailed(
-                    self.config.segment_size(),
-                    self.config.edge_list_empty_capacity(),
-                    OUR_VEC_WITH_GAPS_CONF.clone(),
-                    self.allocator.clone(),
-                ),
-                in_edges: VecWithGaps::many_with_capacity_detailed(
-                    self.config.segment_size(),
-                    self.config.edge_list_empty_capacity(),
-                    OUR_VEC_WITH_GAPS_CONF.clone(),
-                    self.allocator.clone(),
-                ),
-            })
-        }
-        self.total_live_vertices += 1;
-        (nid, is_new)
-    }
-
-    fn remove_vertex(&mut self, v: VAddr) -> bool {
-        self.remove_vertex_innard(v, true)
-    }
-    fn remove_vertex_called(&mut self, v: &K) -> bool {
-        let self_address = match self.mapping.remove(v) {
-            Some(sa) => sa,
-            None => {
-                return false;
-            }
-        };
-        self.remove_vertex_innard(self_address, false)
-    }
-
-    /// Removes one edge going from `from` to `to`. If there are more than one such edge, then we can't make any guarantees about which one will be removed.
-    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> bool {
-        let fl = match self.segments.get_mut(from.segment as usize) {
-            Some(se) => se,
-            None => return false,
-        };
-        let ret = fl
-            .out_edges
-            .remove_from_sorted_section_by(from.index as usize, |b| to.cmp(&b.to))
-            .is_ok();
-        let tl = self.segments.get_mut(to.segment as usize).unwrap(); //wont panic, given that the forward edge being present
-        drop(
-            tl.in_edges
-                .remove_from_sorted_section_by(to.index as usize, |b| from.cmp(b)),
-        );
-        ret
-    }
-
-    /// Note, if you're adding hundreds per second, you should consider batching the adds, some support for that has already been implemented in VecWithGaps. If you are only adding tens per second, though, batching per second wont make a difference, and this will be fine.
-    /// returns true iff this was a new edge, false iff it overrode the old value, error if the indices are out of bounds
-    fn set_edge(&mut self, from: VAddr, to: VAddr, w: E, overwrite: bool) -> Res<bool> {
-        let fl = self
-            .segments
-            .get_mut(from.segment as usize)
-            .ok_or_else(|| NoSegment(from.segment))?;
-        if !fl.out_edges.get_section_slice(from.index as usize).is_ok() {
-            return Err(NoVertex(from));
-        }
-        vwgerr(fl.out_edges.insert_into_sorted_section_by(
-            from.index as usize,
-            Edge { to, weight: w },
-            overwrite,
-            |a, b| a.to.cmp(&b.to),
-        ))?;
-        let tl = self
-            .segments
-            .get_mut(to.segment as usize)
-            .ok_or_else(|| NoSegment(to.segment))?;
-        if !tl.in_edges.get_section_slice(to.index as usize).is_ok() {
-            return Err(NoVertex(to));
-        }
-        vwgerr(
-            tl.in_edges
-                .insert_into_sorted_section(to.index as usize, from),
-        )
-    }
-    fn vertexes(&self) -> Vec<Self::Index> {
-        self.segments
-            .iter()
-            .enumerate()
-            .flat_map(|(si, s)| {
-                s.out_edges
-                    .sections
-                    .iter()
-                    .enumerate()
-                    .take(s.vertex_weights.len())
-                    .filter_map(move |(vi, v)| {
-                        (!v.deleted()).then(|| VAddr {
-                            segment: si as u32,
-                            index: vi as u32,
-                        })
-                    })
-            })
-            .collect()
-    }
-    fn translate_from_k(&self, v: &K) -> Res<Self::Index> {
-        Ok(*self.mapping.get(v).ok_or_else(|| {
-            Misc(format!(
-                "The key {:?} is not present in this CSRPlusPlus",
-                v
-            ))
-        })?)
-    }
-    fn translate_to_k(&self, v: &Self::Index) -> Res<K> {
-        let se = self
-            .segments
-            .get(v.segment as usize)
-            .ok_or_else(|| NoSegment(v.segment))?;
-        if se.out_edges.get_section_slice(v.index as usize).is_ok() {
-            Ok(se.external_vertex_ids[v.index as usize].clone())
-        } else {
-            Err(NoVertex(*v))
-        }
-    }
-    fn v(&self, v: Self::Index) -> Res<&V> {
-        let se = self
-            .segments
-            .get(v.segment as usize)
-            .ok_or_else(|| NoSegment(v.segment))?;
-        if se.out_edges.get_section_slice(v.index as usize).is_ok() {
-            Ok(&se.vertex_weights[v.index as usize])
-        } else {
-            Err(NoVertex(v))
-        }
-    }
-    fn out_edges<'a>(&'a self, v: Self::Index) -> Res<Self::OutIter<'a>> {
-        Ok(self.out_edge_edges(v)?.map(|e| (e.to, &e.weight)))
-    }
-    fn in_edges<'a>(&'a self, v: Self::Index) -> Res<Self::InIter<'a>> {
-        Ok(self
-            .segments
-            .get(v.segment as usize)
-            .ok_or_else(|| NoSegment(v.segment))?
-            .in_edges
-            .get_section_slice(v.index as usize)
-            .map_err(|_| NoVertex(v))?
-            .iter()
-            .cloned())
-    }
-    fn random_vertex(&self, r: &mut Rng) -> Self::Index {
-        if let Some(ls) = self.segments.last() {
-            //should we catch the situations where the deletion load is so high that this would loop for quite a really really long time, and do a more methodical search instead? Okay I guess
-            //this will have to do
-            if self.total_live_vertices <= 0 {
-                return INVALID_VADD;
-            }
-            loop {
-                let lsl = ls.vertex_weights.len();
-                let pr = r.usize(0..self.config.segment_size() * (self.segments.len() - 1) + lsl);
-                let segment = pr / self.config.segment_size();
-                let ps = &self.segments[segment];
-                let index = pr - segment * self.config.segment_size();
-                if ps.out_edges.get_section_slice(index).is_ok() {
-                    return VAddr {
-                        segment: segment as u32,
-                        index: index as u32,
-                    };
-                }
-            }
-        } else {
-            INVALID_VADD
-        }
-    }
-    fn k_and_v(&self, at: Self::Index) -> Res<(&K, &V)> {
-        let ve = self
-            .segments
-            .get(at.segment as usize)
-            .ok_or_else(|| NoSegment(at.segment))?;
-        if ve.vertex_weights.len() < at.index as usize {
-            return Err(NoVertex(at));
-        }
-        Ok((
-            &ve.external_vertex_ids[at.index as usize],
-            &ve.vertex_weights[at.index as usize],
-        ))
-    }
-}
-
-impl<K, V, E, C, A> left_right::Absorb<Edit<K, V, E>> for CSRPlusPlus<K, V, E, C, A>
-where
-    K: Debug + Clone + Hash + Eq,
-    V: Clone,
-    E: Clone,
-    C: Clone + CSRPPTuning,
-    A: Clone + Allocator,
-{
-    fn absorb_first(&mut self, operation: &mut Edit<K, V, E>, _: &Self) {
-        //TODO: log errors??
-        match *operation {
-            NewVertex(ref k, ref v) => {
-                drop(self.set_vertex(k.clone(), v.clone()));
-            }
-            NewEdge(ref add) => {
-                drop(self.set_edge(add.from, add.to, add.weight.clone(), true));
-            }
-            DeleteVertex(ref v) => {
-                self.remove_vertex_called(v);
-            }
-            DeleteDirectedEdges { ref from, ref to } => {
-                if let Ok(tf) = self.translate_from_k(&from) {
-                    if let Ok(tt) = self.translate_from_k(&to) {
-                        self.remove_edge(tf, tt);
-                    }
-                }
-            }
-        }
-    }
-    fn sync_with(&mut self, first: &Self) {
-        *self = first.clone();
-    }
-}
-
-/// `proportion_of_edges` is the proportion of all the edges there could be that will be inserted. Edges can collide (resulting in nothing changing)
-pub fn random_csrpp(
-    node_count: usize,
-    proportion_of_edges: f64,
-    r: &mut Rng,
-) -> CSRPlusPlus<usize, (), ()> {
-    let mut v = CSRPlusPlus::default();
-    for i in 0..node_count {
-        v.set_vertex(i, ());
-    }
-    // println!("{:?}", &v.vertexes());
-    let edge_add_n = (node_count as f64 * proportion_of_edges) as usize;
-    for _ in 0..edge_add_n {
-        //doesn't add reflexive edges then I guess
-        let firsti = r.usize(0..node_count);
-        let secondi = (firsti + r.usize(1..(node_count - 1))) % node_count;
-        v.set_edge(v.into_id(firsti), v.into_id(secondi), (), true)
-            .unwrap();
-    }
-    v
-}
 
 #[cfg(test)]
 mod tests {
