@@ -1,15 +1,11 @@
 // implementation of CSR++: DOI:10.4230/LIPIcs.OPODIS.2020.17
 #![feature(
-    result_into_ok_or_err,
     associated_type_defaults,
-    destructuring_assignment,
     default_free_fn,
-    generic_associated_types,
-    allocator_api
+    allocator_api,
+    return_position_impl_trait_in_trait,
 )]
-
-mod wotdb;
-pub use wotdb::*;
+#[allow(incomplete_features)]
 
 mod genesign_test;
 
@@ -27,8 +23,8 @@ use itertools::Itertools;
 use std::{
     alloc,
     alloc::Allocator,
-    cmp::{Ordering, Ordering::*},
-    collections::{hash_map::Entry::*, HashMap, HashSet, VecDeque},
+    cmp::{Ordering, Ordering::*, Reverse},
+    collections::{hash_map::Entry::*, BinaryHeap, HashMap, HashSet, VecDeque},
     default::{default, Default},
     error::Error,
     fmt,
@@ -36,10 +32,10 @@ use std::{
     hash::Hash,
     iter,
     iter::{ExactSizeIterator, Iterator, Peekable},
-    mem::{drop, replace, size_of}, slice,
+    mem::{replace, size_of},
     vec::Vec,
 };
-use vec_with_gaps::{VecWithGaps};
+use vec_with_gaps::VecWithGaps;
 
 #[derive(Clone)]
 pub struct AdjacencyList<K, V, E> {
@@ -85,10 +81,7 @@ fn binary_insert_if_not_present<V: Ord>(vs: &mut Vec<V>, p: V) -> bool {
     }
 }
 
-fn binary_remove_if_present_by<T, F>(vs: &mut Vec<T>, comp: F) -> Option<T>
-where
-    F: FnMut(&T) -> Ordering,
-{
+fn binary_remove_if_present_by<T>(vs: &mut Vec<T>, comp: impl FnMut(&T) -> Ordering) -> Option<T> {
     match vs.binary_search_by(comp) {
         Ok(_) => None,
         Err(at) => Some(vs.remove(at)),
@@ -129,14 +122,73 @@ impl<K, V, E> Default for AdjacencyList<K, V, E> {
     }
 }
 
-impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
+pub struct ALNeighborIterMut<'a, K, V, E> {
+    this: &'a mut AdjacencyList<K, V, E>,
+    from: usize,
+    up_to: usize,
+}
+impl<'a, K, V, E> Iterator for ALNeighborIterMut<'a, K, V, E> {
+    type Item = &'a mut V;
+    fn next(&mut self) -> Option<&'a mut V> {
+        let fr = &self.this.vertexes[self.from].out_edges;
+        if fr.len() == self.up_to {
+            None
+        } else {
+            let ad = fr[self.up_to].0;
+            self.up_to += 1;
+            //SAFETY: There are no duplicate edges
+            Some(unsafe { &mut *(&mut self.this.vertexes[ad].v as *mut _) })
+        }
+    }
+}
+impl<'a, K, V, E> ExactSizeIterator for ALNeighborIterMut<'a, K, V, E> {
+    fn len(&self) -> usize {
+        self.this.vertexes[self.from].out_edges.len() - self.up_to
+    }
+}
+
+//same as above
+pub struct ALNeighborIter<'a, K, V, E> {
+    this: &'a AdjacencyList<K, V, E>,
+    from: usize,
+    up_to: usize,
+}
+impl<'a, K, V, E> Iterator for ALNeighborIter<'a, K, V, E> {
+    type Item = &'a V;
+    fn next(&mut self) -> Option<&'a V> {
+        let fr = &self.this.vertexes[self.from].out_edges;
+        if fr.len() == self.up_to {
+            None
+        } else {
+            let ad = fr[self.up_to].0;
+            self.up_to += 1;
+            Some(&self.this.vertexes[ad].v)
+        }
+    }
+}
+impl<'a, K, V, E> ExactSizeIterator for ALNeighborIter<'a, K, V, E> {
+    fn len(&self) -> usize {
+        self.this.vertexes[self.from].out_edges.len() - self.up_to
+    }
+}
+
+const INVALID_VLI: usize = usize::max_value();
+
+impl<K, V, E> AdjacencyList<K, V, E>
+where
+    E: Clone,
+    K: Debug + Clone + Hash + Eq,
+{
+    //
     /// by the way, nodes don't have to be specified if they're present in an edge
     pub fn from_edges<'a>(
         nodes: impl Iterator<Item = (K, V)>,
         edges: impl Iterator<Item = (K, K, E)>,
     ) -> Self {
-        let mut vertex_mapping = HashMap::<K, usize>::new();
-        let mut vertexes: Vec<ALVert<_, _, _>> = Vec::new();
+        let mut vertex_mapping =
+            HashMap::<K, usize>::with_capacity(nodes.size_hint().1.unwrap_or(0));
+        let mut vertexes: Vec<ALVert<_, _, _>> =
+            Vec::with_capacity(nodes.size_hint().1.unwrap_or(0));
         let vmm = &mut vertex_mapping;
         let vm = &mut vertexes;
 
@@ -165,10 +217,11 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
             binary_upsert_by_first(&mut vertexes[fromu].out_edges, (fromu, e), true);
             binary_insert_if_not_present(&mut vertexes[tou].in_edges, fromu);
         }
+        let vl = vertexes.len();
         Self {
             mapping: vertex_mapping,
             vertexes: vertexes,
-            total_live_vertices: 0,
+            total_live_vertices: vl,
         }
     }
 
@@ -184,10 +237,10 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
                 let lv: Vec<usize> = oit.chain(ve.in_edges.iter().cloned()).collect();
                 let (in_edges, out_edges) = lv.split_at(sep);
                 for ii in in_edges {
-                    binary_remove_if_present_by(&mut self.vertexes[*ii].out_edges, |b| v.cmp(&b.0));
+                    binary_remove_if_present_by(&mut self.vertexes[*ii].out_edges, |b| b.0.cmp(&v));
                 }
                 for oi in out_edges {
-                    binary_remove_if_present_by(&mut self.vertexes[*oi].in_edges, |b| v.cmp(b));
+                    binary_remove_if_present_by(&mut self.vertexes[*oi].in_edges, |b| b.cmp(&v));
                 }
                 self.total_live_vertices -= 1;
                 return true;
@@ -195,15 +248,33 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
         }
         false
     }
-    pub fn v_mut(&mut self, at: Self::Index) -> Res<&mut V> {
-        self.vertexes
-            .get_mut(at)
-            .ok_or_else(|| NoAdjacencyIndex(at))
-            .map(|a| &mut a.v)
+
+    pub fn dijkstra_from_fold<D: Ord>(
+        &self,
+        start: usize,
+        starting_distance: D,
+        mut fold_distance: impl FnMut(&D, &E) -> D,
+    ) -> Vec<(usize, D)> {
+        let mut front = BinaryHeap::<(Reverse<D>, usize)>::new();
+        let mut seen = HashSet::new();
+        let mut ret = Vec::new();
+        front.push((Reverse(starting_distance), start));
+        while let Some((Reverse(d), ii)) = front.pop() {
+            if seen.contains(&ii) { continue; }
+            seen.insert(ii.clone());
+            for (i, e) in self.out_edges(ii).unwrap() {
+                if seen.contains(&i) { continue; }
+                front.push((Reverse(fold_distance(&d, e)), i));
+            }
+            ret.push((ii, d));
+        }
+        ret
     }
-    pub fn e(&self, a:usize, b:usize)-> Res<&E> {
-        self.out_edges(a).binary_search_by(|&(o, _)| o.cmp(b)).map_err(|_| CSRPPError::NoConnetion(a, b))
+    ///returns id, distance
+    pub fn dijkstra_unweighted(&self, start: usize) -> Vec<(usize, usize)> {
+        self.dijkstra_from_fold(start, 0, |d, _| d + 1)
     }
+
     pub fn from_sized_iters(
         i: impl ExactSizeIterator<Item = (K, V, impl ExactSizeIterator<Item = (K, E)>)> + Clone,
     ) -> Self {
@@ -241,9 +312,6 @@ impl<K: Hash + Eq + Clone, V, E: Clone> AdjacencyList<K, V, E> {
             total_live_vertices: 0,
         }
     }
-    fn invalid_vi()-> Self::Index {
-        u64::max_value()
-    }
 }
 impl<K> AdjacencyList<K, f64, f64> {
     pub fn add_weight_accumulating_sorted_biedge(&mut self, a: usize, b: usize, weight: f64) {
@@ -276,14 +344,12 @@ pub enum Edit<K, V, E> {
     DeleteVertex(K),
     DeleteDirectedEdges { from: K, to: K },
 }
-use Edit::*;
 
 pub struct EdgeAdd<E> {
-    pub from: VAddr,
-    pub to: VAddr,
+    pub from: CSi,
+    pub to: CSi,
     pub weight: E,
 }
-
 
 //   //TODO: Replicate changes to the mapping hashmap with a simple copy iff it expanded since the last sync, otherwise repeat the insertions
 
@@ -295,7 +361,7 @@ pub struct EdgeAdd<E> {
 #[derive(Clone)]
 pub struct CSRPlusPlus<K, V, E, C: CSRPPTuning = (), A: Allocator = alloc::Global> {
     pub segments: Vec<Segment<K, V, E, A>>,
-    pub mapping: HashMap<K, VAddr>,
+    pub mapping: HashMap<K, CSi>,
     pub deletion_load: usize, //the number of vertices known to have been quick deleted (if deletion_load/total_live_vertices > 2.5, you might want to do a reindexing)
     pub total_live_vertices: usize, //the number of vertices known to be present since the last sync
     pub config: C,
@@ -350,21 +416,21 @@ type VWGC = ();
 const OUR_VEC_WITH_GAPS_CONF: VWGC = ();
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VAddr {
+pub struct CSi {
     pub segment: u32,
     pub index: u32,
 }
-impl Default for VAddr {
+impl Default for CSi {
     fn default() -> Self {
-        INVALID_VADD
+        INVALID_CSI
     }
 }
-impl Display for VAddr {
+impl Display for CSi {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "VAddr({} {})", self.segment, self.index)
     }
 }
-const INVALID_VADD: VAddr = VAddr {
+const INVALID_CSI: CSi = CSi {
     segment: u32::max_value(),
     index: u32::max_value(),
 };
@@ -375,11 +441,13 @@ pub struct Segment<K, V, E, A: Allocator> {
     pub external_vertex_ids: Vec<K>,
     pub vertex_weights: Vec<V>,
     pub out_edges: VecWithGaps<Edge<E>, VWGC, A>,
-    pub in_edges: VecWithGaps<VAddr, VWGC, A>,
+    pub in_edges: VecWithGaps<CSi, VWGC, A>,
 }
-impl<K,V,E,A> Segment<K,V,E,A> {
-    fn get_weight(&self, at:VAddr)-> Res<&V> {
-        self.vertex_weights.get(at.index as usize).ok_or_else(|| NoVertex(at))
+impl<K, V, E, A: Allocator> Segment<K, V, E, A> {
+    fn get_weight(&self, at: CSi) -> Result<&V, GraphError<CSi>> {
+        self.vertex_weights
+            .get(at.index as usize)
+            .ok_or_else(|| NoVertex(at))
     }
 }
 
@@ -426,7 +494,7 @@ where
 
 #[derive(Clone)]
 pub struct Edge<E> {
-    pub to: VAddr,
+    pub to: CSi,
     pub weight: E,
 }
 impl<V> PartialEq for Edge<V> {
@@ -462,30 +530,57 @@ where
 }
 
 pub trait Graph<K, V, E> {
-    type InIter<'a>: ExactSizeIterator<Item = Self::Index> + Clone + 'a;
-    type OutIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a E)> + Clone + 'a
-    where
-        E: 'a;
-    type VIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a K, &'a V)> + Clone + 'a;
-    type Index: Debug = usize;
-    type Res<T> = Result<V, CSRPPError<Self::Index>>;
+    // type InIter<'a>: ExactSizeIterator<Item = Self::Index> + Clone
+    // where
+    //     Self: 'a;
+    // type OutIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a E)> + Clone + 'a
+    // where
+    //     E: 'a,
+    //     Self: 'a;
+    // type VIter<'a>: ExactSizeIterator<Item = (Self::Index, &'a K, &'a V)> + Clone + 'a
+    // where
+    //     Self: 'a,
+    //     K: 'a,
+    //     V: 'a;
+    type Index: Debug + Display = usize;
     fn next_id(&self) -> Self::Index; //needed for radial patterning. Must be greater than any vertex ID, and (for memory efficiency) should not be too much greater than the number of vertices in the structure, if it is, maybe regenerate your IDs.
     fn vertexes(&self) -> Vec<Self::Index>;
-    fn vertex_iter(&'a self)-> VIter<'a>;
+    fn vertex_iter<'a>(&'a self) -> impl ExactSizeIterator<Item = (Self::Index, &'a K, &'a V)>
+    where
+        K: 'a,
+        V: 'a;
     fn vertex_count(&self) -> usize;
     /// converts a n:usize into the id that would be nth if the graph were fully packed
     fn into_id(&self, v: usize) -> Self::Index;
     fn from_id(&self, v: Self::Index) -> usize;
-    fn v(&self, at: Self::Index) -> Res<&V>;
-    fn k_and_v(&self, at: Self::Index) -> Res<(&K, &V)>;
+    fn v(&self, at: Self::Index) -> Result<&V, GraphError<Self::Index>>;
+    fn v_mut(&mut self, at: usize) -> Result<&mut V, GraphError<Self::Index>>;
+    fn e(&self, a: usize, b: usize) -> Result<&E, GraphError<Self::Index>>;
+    fn k_and_v(&self, at: Self::Index) -> Result<(&K, &V), GraphError<Self::Index>>;
     /// second val is true iff this was a new insertion
     fn set_vertex(&mut self, k: K, v: V) -> (Self::Index, bool);
     fn remove_vertex(&mut self, v: Self::Index) -> bool;
     fn remove_vertex_called(&mut self, v: &K) -> bool;
     /// `overwrite` is about whether to overwrite the e of any existing edge between these two, if one exists
-    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> Res<E>;
-    fn set_edge(&mut self, a: Self::Index, b: Self::Index, e: E, overwrite: bool) -> Res<bool>;
-    fn set_biedge(&mut self, a: Self::Index, b: Self::Index, w: E, overwrite: bool) -> Res<()>
+    fn remove_edge(
+        &mut self,
+        from: Self::Index,
+        to: Self::Index,
+    ) -> Result<E, GraphError<Self::Index>>;
+    fn set_edge(
+        &mut self,
+        a: Self::Index,
+        b: Self::Index,
+        e: E,
+        overwrite: bool,
+    ) -> Result<bool, GraphError<Self::Index>>;
+    fn set_biedge(
+        &mut self,
+        a: Self::Index,
+        b: Self::Index,
+        w: E,
+        overwrite: bool,
+    ) -> Result<(), GraphError<Self::Index>>
     where
         Self::Index: Clone,
         E: Clone,
@@ -494,15 +589,41 @@ pub trait Graph<K, V, E> {
         self.set_edge(b.clone(), a.clone(), w, overwrite)?;
         Ok(())
     }
-    fn out_edges<'a>(&'a self, v: Self::Index) -> Res<Self::OutIter<'a>>;
-    fn out_neighbors<'a>(&'a self, v: Self::Index)-> Res<Map<Self::OutIter<'a>, fn((Self::Index, &'a E))-> (Self::Index, &'a V)>> {
-        self.out_edges(v).map(|o| o.map(|(i, _)| self.v(i).unwrap()))
+    fn out_edges<'a>(
+        &'a self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = (Self::Index, &'a E)>, GraphError<Self::Index>>
+    where
+        E: 'a;
+    fn out_neighbors<'a>(
+        &'a self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = &'a V>, GraphError<Self::Index>>
+    where
+        E: 'a,
+        V: 'a,
+    {
+        self.out_edges(v)
+            .map(|o| o.map(|(i, _)| self.v(i).unwrap()))
     }
-    fn in_edges<'a>(&'a self, v: Self::Index) -> Res<Self::InIter<'a>>;
+    // type NeighborIterMut<'a>: Iterator<Item = &'a mut V>
+    // where
+    //     Self: 'a,
+    //     V: 'a;
+    fn out_neighbors_mut<'a>(
+        &'a mut self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = &'a mut V>, GraphError<Self::Index>>
+    where
+        V: 'a;
+    fn in_edges<'a>(
+        &'a self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = Self::Index> + 'a, GraphError<Self::Index>>;
     /// (must point to a live vertex (is that obvious?))
     fn random_vertex(&self, r: &mut Rng) -> Self::Index;
-    fn translate_from_k(&self, v: &K) -> Res<Self::Index>;
-    fn translate_to_k(&self, v: &Self::Index) -> Res<K>;
+    fn translate_from_k(&self, v: &K) -> Result<Self::Index, GraphError<Self::Index>>;
+    fn translate_to_k(&self, v: &Self::Index) -> Result<K, GraphError<Self::Index>>;
     fn mapping(&self) -> &HashMap<K, Self::Index>;
 }
 
@@ -511,18 +632,21 @@ where
     E: Clone,
     K: Debug + Clone + Hash + Eq,
 {
-    type InIter<'a> = iter::Cloned<slice::Iter<'a, Self::Index>>;
-    type OutIter<'a>
-    where
-        E: 'a,
-    = iter::Map<
-        slice::Iter<'a, (Self::Index, E)>,
-        fn(&'a (Self::Index, E)) -> (Self::Index, &'a E),
-    >;
-    type VIter<'a> = Map<Enumerate<Iter<ALVert<K, V, E>>>, fn((Self::Index, &'a ALVert<K,V,E>)) -> (Self::Index, &'a K, &'a V)>;
     type Index = usize;
     fn from_id(&self, v: Self::Index) -> Self::Index {
         v
+    }
+    fn v_mut(&mut self, at: usize) -> Result<&mut V, GraphError<Self::Index>> {
+        self.vertexes
+            .get_mut(at)
+            .ok_or_else(|| NoVertex(at))
+            .map(|a| &mut a.v)
+    }
+    fn e(&self, a: usize, b: usize) -> Result<&E, GraphError<Self::Index>> {
+        let oe = &self.vertexes.get(a).ok_or(NoVertex(a))?.out_edges;
+        oe.binary_search_by(|&(o, _)| o.cmp(&b))
+            .map(|at| &oe[at].1)
+            .map_err(|_| GraphError::NoConnection(a, b))
     }
     fn into_id(&self, v: usize) -> Self::Index {
         v as Self::Index
@@ -530,21 +654,30 @@ where
     fn mapping(&self) -> &HashMap<K, Self::Index> {
         &self.mapping
     }
-    fn set_edge(&mut self, from: usize, to: usize, w: E, overwrite: bool) -> Res<bool> {
-        let ve = &mut self
-            .vertexes
-            .get_mut(from)
-            .ok_or_else(|| NoAdjacencyIndex(from))?;
+    fn set_edge(
+        &mut self,
+        from: usize,
+        to: usize,
+        w: E,
+        overwrite: bool,
+    ) -> Result<bool, GraphError<Self::Index>> {
+        let ve = &mut self.vertexes.get_mut(from).ok_or_else(|| NoVertex(from))?;
         let ret = binary_upsert_by_first(&mut ve.out_edges, (to, w), overwrite);
-        self.total_live_vertices += ret as usize;
-        binary_insert_if_not_present(&mut ve.in_edges, from);
+        let vo = self.vertexes.get_mut(to).ok_or_else(|| NoVertex(to))?;
+        binary_insert_if_not_present(&mut vo.in_edges, from);
         Ok(ret)
     }
-    fn out_edges<'a>(&'a self, v: Self::Index) -> Res<Self::OutIter<'a>> {
+    fn out_edges<'a>(
+        &'a self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = (Self::Index, &'a E)>, GraphError<Self::Index>>
+    where
+        E: 'a,
+    {
         Ok(self
             .vertexes
             .get(v)
-            .ok_or_else(|| NoAdjacencyIndex(v))?
+            .ok_or_else(|| NoVertex(v))?
             .out_edges
             .iter()
             .map(|(i, e)| (i.clone(), e)))
@@ -552,15 +685,36 @@ where
     fn vertex_count(&self) -> usize {
         self.total_live_vertices
     }
-    fn in_edges<'a>(&'a self, v: Self::Index) -> Res<Self::InIter<'a>> {
+    fn in_edges<'a>(
+        &'a self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = Self::Index> + 'a, GraphError<Self::Index>> {
         Ok(self
             .vertexes
             .get(v)
-            .ok_or_else(|| NoAdjacencyIndex(v))?
+            .ok_or_else(|| NoVertex(v))?
             .in_edges
             .iter()
             .cloned())
     }
+
+    // type NeighborIterMut<'a> = iter::Map<Vec<Self::Index>::IntoIter, fn(Self::Index) -> &'a mut V>;
+    fn out_neighbors_mut<'a>(
+        &'a mut self,
+        v: Self::Index,
+    ) -> Result<impl ExactSizeIterator<Item = &'a mut V>, GraphError<Self::Index>>
+    where
+        V: 'a,
+    {
+        //just make sure that exists
+        self.v_mut(v)?;
+        Ok(ALNeighborIterMut {
+            this: self,
+            from: v,
+            up_to: 0,
+        })
+    }
+
     fn remove_vertex_called(&mut self, v: &K) -> bool {
         let self_address = match self.mapping.remove(v) {
             Some(sa) => sa,
@@ -573,7 +727,7 @@ where
     fn remove_vertex(&mut self, v: Self::Index) -> bool {
         self.remove_vertex_innard(v, true)
     }
-    fn translate_from_k(&self, v: &K) -> Res<Self::Index> {
+    fn translate_from_k(&self, v: &K) -> Result<Self::Index, GraphError<Self::Index>> {
         Ok(*self.mapping.get(v).ok_or_else(|| {
             Misc(format!(
                 "Key {:?} does not correspond to an internal index",
@@ -581,19 +735,19 @@ where
             ))
         })?)
     }
-    fn translate_to_k(&self, v: &Self::Index) -> Res<K> {
+    fn translate_to_k(&self, v: &Self::Index) -> Result<K, GraphError<Self::Index>> {
         self.vertexes
             .get(*v)
-            .ok_or_else(|| NoAdjacencyIndex(*v))
+            .ok_or_else(|| NoVertex(*v))
             .map(|v| v.k.clone())
     }
     fn next_id(&self) -> usize {
         self.vertexes.len()
     }
-    fn v(&self, at: Self::Index) -> Res<&V> {
+    fn v(&self, at: Self::Index) -> Result<&V, GraphError<Self::Index>> {
         self.vertexes
             .get(at)
-            .ok_or_else(|| NoAdjacencyIndex(at))
+            .ok_or_else(|| NoVertex(at))
             .map(|a| &a.v)
     }
     fn vertexes(&self) -> Vec<Self::Index> {
@@ -601,8 +755,14 @@ where
             .filter(|i| !self.vertexes[*i].deleted)
             .collect()
     }
-    fn vertex_iter(&'a self)-> VIter<'a> {
-        self.vertexes.iter().enumerate().map(|i, alv| (i, &alv.k, &alv.v))
+    fn vertex_iter<'a>(&'a self) -> impl ExactSizeIterator<Item = (Self::Index, &'a K, &'a V)>
+    where
+        V: 'a,
+    {
+        self.vertexes
+            .iter()
+            .enumerate()
+            .map(|(i, alv)| (i, &alv.k, &alv.v))
     }
     fn random_vertex(&self, r: &mut Rng) -> Self::Index {
         r.usize(0..self.vertexes.len())
@@ -625,19 +785,25 @@ where
                     in_edges: Vec::new(),
                     deleted: false,
                 });
+                self.total_live_vertices += 1;
                 true
             }
         };
         (r, is_new)
     }
-    fn remove_edge(&mut self, from: Self::Index, to: Self::Index) -> Res<E> {
+    fn remove_edge(
+        &mut self,
+        from: Self::Index,
+        to: Self::Index,
+    ) -> Result<E, GraphError<Self::Index>> {
         let fv = self.vertexes.get_mut(from).ok_or_else(|| NoVertex(from))?;
-        let (_, ret) = binary_remove_if_present_by(&mut fv.out_edges, |b| to.cmp(&b.0)).ok_or_else(|| NoConnection(a, b))?;
+        let (_, ret) = binary_remove_if_present_by(&mut fv.out_edges, |b| b.0.cmp(&to))
+            .ok_or_else(|| NoConnection(from, to))?;
         binary_remove(&mut self.vertexes[to].in_edges, &from);
         Ok(ret)
     }
-    fn k_and_v(&self, at: Self::Index) -> Res<(&K, &V)> {
-        let ve = self.vertexes.get(at).ok_or_else(|| NoAdjacencyIndex(at))?;
+    fn k_and_v(&self, at: Self::Index) -> Result<(&K, &V), GraphError<Self::Index>> {
+        let ve = self.vertexes.get(at).ok_or_else(|| NoVertex(at))?;
         Ok((&ve.k, &ve.v))
     }
 }
@@ -700,7 +866,7 @@ fn create_radial_patterning_detailed<Index, K, V, E>(
 ) -> Vec<Index>
 where
     K: Debug,
-    Index: Clone + Debug,
+    Index: Clone + Debug + Display,
 {
     let mut unseen: Vec<Index> = g.vertexes();
     let mut seen = bitvec::bitvec![0;g.from_id(g.next_id())];
@@ -762,20 +928,19 @@ where
 // }
 
 #[derive(Debug, Clone)]
-pub enum CSRPPError<VA> {
+pub enum GraphError<VA: Display> {
     NoSegment(u32),
     NoVertex(VA),
     NotLandmark(VA),
-    NoConnetion(VA, VA),
-    NoAdjacencyIndex(usize),
+    NoConnection(VA, VA),
     VecWithGapsIssue(String),
     Misc(String),
 }
-use CSRPPError::*;
-fn vwgerr<T>(v: Result<T, String>) -> Result<T, CSRPPError> {
-    v.map_err(|s| VecWithGapsIssue(s))
-}
-impl Display for CSRPPError {
+use GraphError::*;
+impl<I> Display for GraphError<I>
+where
+    I: Display,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         match *self {
             NoSegment(segment) => write!(
@@ -783,16 +948,15 @@ impl Display for CSRPPError {
                 "Graph error: getting segment {} failed, out of bounds",
                 segment
             ),
-            NoVertex(index) => write!(
+            NoVertex(ref index) => write!(
                 f,
-                "Graph error: getting vertex at index {:?} failed, vertex index {} does not exist",
-                index, index.index
+                "Graph error: getting vertex at index {} failed, no such vertex",
+                index
             ),
-            NoConnetion(a, b)=> write!(f, "Graph error: the nodes {} and {} weren't conneted", a, b),
-            NotLandmark(a)=> write!(f, "Graph error: {} is not a landmark", a)
-            NoAdjacencyIndex(index) => {
-                write!(f, "Graph error: AdjacencyList getting vertex at index {} failed", index)
+            NoConnection(ref a, ref b) => {
+                write!(f, "Graph error: the nodes {} and {} weren't conneted", a, b)
             }
+            NotLandmark(ref a) => write!(f, "Graph error: {} is not a landmark", a),
             VecWithGapsIssue(ref message) => {
                 write!(
                     f,
@@ -804,11 +968,7 @@ impl Display for CSRPPError {
         }
     }
 }
-impl Error for CSRPPError {
-    fn description(&self) -> &str {
-        "error in CSRPlusPlus"
-    }
-}
+impl<I: Debug + Display> Error for GraphError<I> {}
 
 impl<K, V, E> Default for CSRPlusPlus<K, V, E, (), alloc::Global>
 where
@@ -838,8 +998,8 @@ where
     }
 }
 
-fn csrpp_offset_to_id(segment_size: usize, v: usize) -> VAddr {
-    VAddr {
+fn csrpp_offset_to_id(segment_size: usize, v: usize) -> CSi {
+    CSi {
         segment: (v / segment_size) as u32,
         index: (v % segment_size) as u32,
     }
@@ -877,7 +1037,7 @@ where
             &mut rng,              //r: &mut impl Rng,
         );
         //TODO: Maybe do this in the radial patterning instead of here, you'll be able to skip the VAddr calculation sorta. Also, these values don't need to be initialized.
-        let mut patterning_backmapping: Vec<VAddr> = iter::repeat(VAddr::default())
+        let mut patterning_backmapping: Vec<CSi> = iter::repeat(CSi::default())
             .take(al.from_id(al.next_id()))
             .collect();
         for (from, to) in patterning.iter().enumerate() {
@@ -973,11 +1133,13 @@ where
         Self::from_graph_with_radial_patterning(al, config, allocator)
     }
 
-    fn get_segment(&self, at: VAddr)-> Res<&Segment<K,V,E,Alloc>> {
-        self.segments.get(at.segment as usize).ok_or_else(|| NoSegment(at.segment))
+    fn get_segment(&self, at: CSi) -> Result<&Segment<K, V, E, Alloc>, GraphError<CSi>> {
+        self.segments
+            .get(at.segment as usize)
+            .ok_or_else(|| NoSegment(at.segment))
     }
-    
-    fn remove_vertex_innard(&mut self, at: VAddr, handle_mapping: bool) -> bool {
+
+    fn remove_vertex_innard(&mut self, at: CSi, handle_mapping: bool) -> bool {
         let se = if let Some(se) = self.segments.get_mut(at.segment as usize) {
             se
         } else {
@@ -1011,7 +1173,7 @@ where
             .cloned();
         let sep = out_iter.len();
         // saves an allocation by sharing vecs
-        let referrers: Vec<VAddr> = out_iter.chain(in_iter).collect();
+        let referrers: Vec<CSi> = out_iter.chain(in_iter).collect();
         let (out_slice, in_slice) = referrers.split_at(sep);
         for (block_segmenti, oout_e, oin_e) in match_when_possible(
             out_slice.iter().group_by(|s| s.segment).into_iter(),
@@ -1022,7 +1184,7 @@ where
             let bse = self
                 .segments
                 .get_mut(block_segmenti as usize)
-                .ok_or_else(|| NoSegment(block_segmenti))
+                .ok_or_else(|| NoSegment::<CSi>(block_segmenti))
                 .unwrap();
             if let Some(out_e) = oout_e {
                 for e in out_e {
@@ -1049,19 +1211,19 @@ where
         true
     }
 
-    pub fn translate_from_keys(&self, i: impl Iterator<Item = K>) -> Vec<VAddr> {
+    pub fn translate_from_keys(&self, i: impl Iterator<Item = K>) -> Vec<CSi> {
         i.map(|k| self.mapping[&k].clone()).collect()
     }
 
     //TODO: perf test this against the next one
-    pub fn translate_to_keys_naive(&self, i: impl Iterator<Item = VAddr>) -> Vec<K> {
+    pub fn translate_to_keys_naive(&self, i: impl Iterator<Item = CSi>) -> Vec<K> {
         i.map(|index| {
             self.segments[index.segment as usize].external_vertex_ids[index.index as usize].clone()
         })
         .collect()
     }
     //I'll presume that this will be faster or neutral
-    pub fn translate_to_keys_batched(&self, i: impl Iterator<Item = VAddr>) -> Vec<K> {
+    pub fn translate_to_keys_batched(&self, i: impl Iterator<Item = CSi>) -> Vec<K> {
         i.group_by(|index| index.segment)
             .into_iter()
             .flat_map(|(si, indexes)| {
@@ -1094,32 +1256,32 @@ where
     /// these things probably don't win all that much performance, but it will be fun to see
     pub fn breadth_search_ignore_weights(
         &self,
-        from: VAddr,
-        to: VAddr,
+        from: CSi,
+        to: CSi,
         count_limit: usize,
         depth_limit: usize,
-    ) -> Vec<VAddr> {
+    ) -> Vec<CSi> {
         if from == to {
             return vec![from];
         }
         // let mut locked_segments:Vec<usize> = Vec::new();
-        let mut found: Vec<(usize, VAddr)> = Vec::new(); //a record of the found vertices, pointing back to the found vertex it was found through, enabling tracing back the chain at the end
+        let mut found: Vec<(usize, CSi)> = Vec::new(); //a record of the found vertices, pointing back to the found vertex it was found through, enabling tracing back the chain at the end
 
-        let mut frontier: VecDeque<(usize, VAddr)> = VecDeque::new(); //first represents the index in found this address has in found
+        let mut frontier: VecDeque<(usize, CSi)> = VecDeque::new(); //first represents the index in found this address has in found
         found.push((0, from));
         frontier.push_front((0, from));
-        let mut seen: HashSet<VAddr> =
+        let mut seen: HashSet<CSi> =
             HashSet::with_capacity((count_limit as f64 * 1.3).ceil() as usize); //we want to make sure that once it starts getting full it isn't just collisions all day... it might do this internally, TODO: Test that
         let mut depth = 0;
         while let Some((parenti, fno)) = frontier.pop_front() {
-            if fno == INVALID_VADD {
-                frontier.push_front((0, INVALID_VADD));
+            if fno == INVALID_CSI {
+                frontier.push_front((0, INVALID_CSI));
                 depth += 1;
             }
             for (eto, _) in self.out_edges(fno).unwrap() {
                 if !seen.contains(&eto) {
                     if eto == to {
-                        let mut path: Vec<VAddr> = Vec::new();
+                        let mut path: Vec<CSi> = Vec::new();
                         found.push((parenti, eto));
                         let mut pparenti = parenti;
                         let mut pcf = eto;
@@ -1145,7 +1307,10 @@ where
         Vec::new()
     }
 
-    fn out_edge_edges<'a>(&'a self, from: VAddr) -> Res<slice::Iter<'a, Edge<E>>> {
+    fn out_edges<'a>(
+        &'a self,
+        from: CSi,
+    ) -> Result<impl Iterator<Item = (CSi, &'a E)>, GraphError<CSi>> {
         Ok(self
             .segments
             .get(from.segment as usize)
@@ -1153,7 +1318,8 @@ where
             .out_edges
             .get_section_slice(from.index as usize)
             .map_err(|_| NoVertex(from))?
-            .iter())
+            .iter()
+            .map(|ee| (ee.to, &ee.weight)))
     }
 
     // fn add_edge_batched(&mut self, a:VAddr, b:VAddr, w:E)-> bool {
@@ -1246,75 +1412,75 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     extern crate itertools;
     use super::*;
 
-    #[test]
-    fn csrpp_equal() {
-        let a = random_csrpp(340, 1.2, &mut Rng::with_seed(30));
-        let b = random_csrpp(340, 1.2, &mut Rng::with_seed(30));
-        assert!(&a == &b);
-    }
+    //these are commented out because we no longer have random_csrpp (because I'm pretty sure I'm getting rid of csrpp, and the tests have already been run). It just generated a random csrpp with $1 vertices and uh, gosh I don't remember what $2 meant. Check past commits.
+    // #[test]
+    // fn csrpp_equal() {
+    //     let a = random_csrpp(340, 1.2, &mut Rng::with_seed(30));
+    //     let b = random_csrpp(340, 1.2, &mut Rng::with_seed(30));
+    //     assert!(&a == &b);
+    // }
 
-    #[test]
-    fn radial_patterning_doesnt_crash() {
-        let a = random_csrpp(70000, 1.5, &mut Rng::with_seed(48));
-        let _b =
-            CSRPlusPlus::from_graph_with_radial_patterning(&a, (), std::alloc::Global::default());
-    }
+    // #[test]
+    // fn radial_patterning_doesnt_crash() {
+    //     let a = random_csrpp(70000, 1.5, &mut Rng::with_seed(48));
+    //     let _b =
+    //         CSRPlusPlus::from_graph_with_radial_patterning(&a, (), std::alloc::Global::default());
+    // }
 
-    #[test]
-    fn big_attack_csrpp() {
-        //makes a random graph
-        let mut r = Rng::with_seed(5);
-        let n = 120;
-        let mut v = random_csrpp(n, 0.3, &mut r);
-        //delete some vertexes
-        let delete_p = 0.1;
-        let delete_n = (n as f64 * delete_p) as usize;
-        for _ in 0..delete_n {
-            v.remove_vertex(v.random_vertex(&mut r));
-        }
+    // #[test]
+    // fn big_attack_csrpp() {
+    //     //makes a random graph
+    //     let mut r = Rng::with_seed(5);
+    //     let n = 120;
+    //     let mut v = random_csrpp(n, 0.3, &mut r);
+    //     //delete some vertexes
+    //     let delete_p = 0.1;
+    //     let delete_n = (n as f64 * delete_p) as usize;
+    //     for _ in 0..delete_n {
+    //         v.remove_vertex(v.random_vertex(&mut r));
+    //     }
 
-        fn sample<'a, T>(r: &mut Rng, v: &'a Vec<T>) -> Option<&'a T> {
-            if v.len() != 0 {
-                Some(&v[r.usize(0..v.len())])
-            } else {
-                None
-            }
-        }
+    //     fn sample<'a, T>(r: &mut Rng, v: &'a Vec<T>) -> Option<&'a T> {
+    //         if v.len() != 0 {
+    //             Some(&v[r.usize(0..v.len())])
+    //         } else {
+    //             None
+    //         }
+    //     }
 
-        let wandern = 500;
-        let mut cur_v = v.random_vertex(&mut r);
-        // just wandering around the graph randomly
-        for _ in 0..wandern {
-            let mut es: Vec<VAddr>;
-            loop {
-                es = v.out_edges(cur_v).unwrap().map(|v| v.0).collect();
-                if es.len() != 0 {
-                    break;
-                }
-                //back out
-                es = v.in_edges(cur_v).unwrap().collect();
-                if es.len() != 0 {
-                    break;
-                }
-                //then just start somewhere else
-                cur_v = v.random_vertex(&mut r);
-            }
-            cur_v = sample(&mut r, &es).unwrap().clone();
-        }
+    //     let wandern = 500;
+    //     let mut cur_v = v.random_vertex(&mut r);
+    //     // just wandering around the graph randomly
+    //     for _ in 0..wandern {
+    //         let mut es: Vec<CSi>;
+    //         loop {
+    //             es = v.out_edges(cur_v).unwrap().map(|v| v.0).collect();
+    //             if es.len() != 0 {
+    //                 break;
+    //             }
+    //             //back out
+    //             es = v.in_edges(cur_v).unwrap().collect();
+    //             if es.len() != 0 {
+    //                 break;
+    //             }
+    //             //then just start somewhere else
+    //             cur_v = v.random_vertex(&mut r);
+    //         }
+    //         cur_v = sample(&mut r, &es).unwrap().clone();
+    //     }
 
-        //delete some edges
-        let edge_deletion_p = 0.5;
-        let edge_deletion_n = ((n * n) as f64 * edge_deletion_p) as usize;
-        for _ in 0..edge_deletion_n {
-            v.remove_edge(v.random_vertex(&mut r), v.random_vertex(&mut r));
-        }
+    //     //delete some edges
+    //     let edge_deletion_p = 0.5;
+    //     let edge_deletion_n = ((n * n) as f64 * edge_deletion_p) as usize;
+    //     for _ in 0..edge_deletion_n {
+    //         v.remove_edge(v.random_vertex(&mut r), v.random_vertex(&mut r));
+    //     }
 
-        assert!(v.vertex_count() > 0);
-    }
+    //     assert!(v.vertex_count() > 0);
+    // }
 }
