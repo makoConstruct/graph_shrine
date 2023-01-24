@@ -257,7 +257,7 @@ impl Display for Gen1_64 {
 
 
 
-const PLOIDY: usize = 100;
+const PLOIDY: usize = 60;
 
 struct Body<G> {
     //never changes, is also the node's key
@@ -454,13 +454,12 @@ fn run_test<GenomeType: Genome>(conf: &TestConf<GenomeType>) {
 
     if conf.show_similarity {
         for (i, _, b) in g.vertex_iter() {
-            let p = if i == middlei { "→" } else { "" };
             let total_similarity = b
                 .somatic
                 .iter()
                 .map(|a| a.similarity(&middleg))
                 .fold(0, |a, b| a + b);
-            print!("{}{} ", p, total_similarity);
+            print!("{}{} ", if i == middlei { "→" } else { "" }, total_similarity);
         }
         print!("\n");
     }
